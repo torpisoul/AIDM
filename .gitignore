@@ -1,6 +1,7 @@
 node_modules
 dist
 .vite
+.netlify
 *.tsbuildinfo
 test-results/
 playwright-report/

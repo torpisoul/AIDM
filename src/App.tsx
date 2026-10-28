@@ -76,6 +76,8 @@ const phaseLabels: Record<Phase, string> = {
   speaking: "The DM is speaking",
 };
 
+const ttsEndpoint = import.meta.env.VITE_TTS_API_URL || "/api/tts";
+
 function nowLabel() {
   return new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date());
 }
@@ -270,7 +272,7 @@ function App() {
     setNotice("Generating narration with ElevenLabs…");
 
     try {
-      const response = await fetch("/api/tts", {
+      const response = await fetch(ttsEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: narration }),
@@ -513,7 +515,7 @@ function App() {
               className="demo-audio"
               controls
               preload="auto"
-              src="/audio/demo-narration.wav"
+              src={`${import.meta.env.BASE_URL}audio/demo-narration.wav`}
               aria-label="Dungeon Master narration audio"
               onPlay={handleAudioPlay}
               onEnded={() => setPhase("idle")}

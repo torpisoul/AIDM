@@ -64,3 +64,30 @@ Install Playwright's browser once before running browser tests:
 ```sh
 npx playwright install chromium
 ```
+
+## Deploy a public demo
+
+The TTS backend is deployed to
+`https://aidm-table-console-torpisoul.netlify.app`. To activate speech
+generation, add `ELEVENLABS_API_KEY` in Netlify **Site configuration →
+Environment variables** and scope it to the Functions runtime. Do not put the
+key in GitHub or in a `VITE_` variable. The selected voice, model, and allowed
+GitHub Pages origin are already configured on the Netlify site. Redeploy after
+adding the key, then verify
+`https://aidm-table-console-torpisoul.netlify.app/api/health` reports
+`{"ttsConfigured":true}`.
+
+The GitHub Pages workflow builds the app at `https://torpisoul.github.io/AIDM/`
+whenever `main` changes. In the repository's **Settings → Pages**, set the
+source to **GitHub Actions**. Push to `main` or run the **Deploy GitHub Pages**
+workflow to publish the frontend. The workflow already targets the deployed
+Netlify function URL.
+
+The Netlify site is currently deployed directly from the CLI rather than
+connected to Git-based continuous deployment. To publish backend changes from
+this workspace, run `netlify deploy --prod`.
+
+Do not add the ElevenLabs key to GitHub, a `VITE_` variable, or the frontend.
+The TTS endpoint is publicly reachable by design for the demo; CORS only
+restricts browser origins and is not authentication. Keep the link limited to
+people you trust and set usage/credit limits in ElevenLabs.
