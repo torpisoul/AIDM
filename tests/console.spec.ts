@@ -30,7 +30,7 @@ test("plays real narration audio in the browser", async ({ page }) => {
 test("records a player's voice, transcribes it, resolves the action, and voices the DM reply", async ({ page }) => {
   let ttsRequestBody: { text: string } | undefined;
   let sttRequest: { contentType: string; byteLength: number } | undefined;
-  let dmRequestBody: { action: string; story: { premise: string }; history: unknown[] } | undefined;
+  let dmRequestBody: { responses: { player: { name: string }; action: string | null }[]; story: { premise: string }; history: unknown[] } | undefined;
   await page.route("**/api/stt", async (route) => {
     sttRequest = {
       contentType: route.request().headers()["content-type"],
@@ -94,8 +94,15 @@ test("records a player's voice, transcribes it, resolves the action, and voices 
   await expect.poll(() => sttRequest?.byteLength).toBeGreaterThan(0);
   expect(sttRequest?.contentType).toContain("audio/webm");
   await expect(page.getByText("I follow the footprints", { exact: false })).toBeVisible();
+  await expect(page.getByText("1 of 4 responses received")).toBeVisible();
+  expect(dmRequestBody).toBeUndefined();
+  await page.getByRole("button", { name: "Do nothing as Bren" }).click();
+  await page.getByRole("button", { name: "Do nothing as Mira" }).click();
+  await page.getByRole("button", { name: "Do nothing as Rowan" }).click();
   await expect(page.getByText("The lantern bobs toward the standing stones", { exact: false })).toBeVisible();
-  await expect.poll(() => dmRequestBody?.action).toBe("I follow the footprints");
+  await expect.poll(() => dmRequestBody?.responses.length).toBe(4);
+  expect(dmRequestBody?.responses[0].action).toBe("I follow the footprints");
+  expect(dmRequestBody?.responses.slice(1).every((item) => item.action === null)).toBe(true);
   expect(dmRequestBody?.story.premise).toContain("Briar Glen");
   expect(dmRequestBody?.history.length).toBeGreaterThan(0);
   await expect.poll(() => ttsRequestBody?.text).toContain("Do you follow it?");
@@ -104,6 +111,80 @@ test("records a player's voice, transcribes it, resolves the action, and voices 
     (element as HTMLAudioElement).pause();
   });
   await expect(brenButton).toBeEnabled();
+});
+
+test("unanimous group choices reveal a shared push-to-talk action for the party", async ({ page }) => {
+  let dmRequestBody: {
+    responses: { player: { name: string }; action: string | null; choice: string | null }[];
+    groupAction: string | null;
+  } | undefined;
+  let sttRequestMade = false;
+  await page.route("**/api/stt", async (route) => {
+    sttRequestMade = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ text: "We follow the lantern north." }),
+    });
+  });
+  await page.route("**/api/dm", async (route) => {
+    dmRequestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ text: "Together, you follow the lantern into the trees." }),
+    });
+  });
+  await page.route("**/api/tts", (route) => route.fulfill({
+    status: 200,
+    contentType: "audio/wav",
+    body: narrationAudio,
+  }));
+  await page.addInitScript(() => {
+    class TestRecorder {
+      state = "inactive";
+      mimeType = "audio/webm";
+      ondataavailable: ((event: { data: Blob }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onstop: (() => void) | null = null;
+      static isTypeSupported() {
+        return true;
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        this.state = "inactive";
+        this.ondataavailable?.({ data: new Blob(["group voice audio"], { type: this.mimeType }) });
+        this.onstop?.();
+      }
+    }
+
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) },
+    });
+    Object.defineProperty(window, "MediaRecorder", { configurable: true, value: TestRecorder });
+  });
+
+  await page.goto("/");
+  for (const player of ["Aria", "Bren", "Mira", "Rowan"]) {
+    await page.getByRole("button", { name: `Go with the group as ${player}` }).click();
+  }
+
+  const partyMic = page.getByRole("button", { name: "Push to talk for the party" });
+  await expect(partyMic).toBeVisible();
+  expect(dmRequestBody).toBeUndefined();
+  await partyMic.dispatchEvent("pointerdown", { pointerId: 1, pointerType: "mouse", button: 0 });
+  await expect(page.getByText("Listening to")).toBeVisible();
+  await partyMic.dispatchEvent("pointerup", { pointerId: 1, pointerType: "mouse", button: 0 });
+  await expect.poll(() => sttRequestMade).toBe(true);
+  await expect(page.getByText("Together, you follow the lantern", { exact: false })).toBeVisible();
+  expect(dmRequestBody?.groupAction).toBe("We follow the lantern north.");
+  expect(dmRequestBody?.responses).toHaveLength(4);
+  expect(dmRequestBody?.responses.every((response) =>
+    response.choice === "group" && response.action === null)).toBe(true);
+  await expect(page.getByText("We follow the lantern north.", { exact: false })).toBeVisible();
 });
 
 test("reports unavailable microphone access and preserves text input", async ({ page }) => {
@@ -164,7 +245,7 @@ test("shows transcription service errors and unlocks the player controls", async
 
 test("submits a text action to the session feed", async ({ page }) => {
   let ttsRequestBody: { text: string } | undefined;
-  let dmRequestBody: { action: string; story: { scene: string; style: string } } | undefined;
+  let dmRequestBody: { responses: { player: { name: string }; action: string | null }[]; story: { scene: string; style: string } } | undefined;
   await page.route("**/api/dm", async (route) => {
     dmRequestBody = route.request().postDataJSON();
     await route.fulfill({
@@ -182,10 +263,14 @@ test("submits a text action to the session feed", async ({ page }) => {
   await page.getByRole("textbox", { name: "DM style and tone" }).fill("Playful, eerie, and full of sensory detail.");
   await page.getByRole("textbox", { name: "Action or question" }).fill("I inspect the standing stones.");
   await page.getByRole("button", { name: "Send action" }).click();
+  await page.getByRole("button", { name: "Do nothing as Bren" }).click();
+  await page.getByRole("button", { name: "Do nothing as Mira" }).click();
+  await page.getByRole("button", { name: "Do nothing as Rowan" }).click();
 
   await expect(page.getByText("I inspect the standing stones.")).toBeVisible();
   await expect(page.getByText("The stones whisper your name", { exact: false })).toBeVisible();
-  await expect.poll(() => dmRequestBody?.action).toBe("I inspect the standing stones.");
+  await expect.poll(() => dmRequestBody?.responses.length).toBe(4);
+  expect(dmRequestBody?.responses[0].action).toBe("I inspect the standing stones.");
   expect(dmRequestBody?.story.scene).toBe("A brass observatory door stands in the forest.");
   expect(dmRequestBody?.story.style).toBe("Playful, eerie, and full of sensory detail.");
   await expect.poll(() => ttsRequestBody?.text).toContain("How do you answer?");
@@ -218,9 +303,12 @@ test("surfaces AI DM errors without a deterministic fallback", async ({ page }) 
   await page.goto("/");
   await page.getByRole("textbox", { name: "Action or question" }).fill("I open the door.");
   await page.getByRole("button", { name: "Send action" }).click();
+  await page.getByRole("button", { name: "Do nothing as Bren" }).click();
+  await page.getByRole("button", { name: "Do nothing as Mira" }).click();
+  await page.getByRole("button", { name: "Do nothing as Rowan" }).click();
   await expect(page.getByText("Set GEMINI_API_KEY in the server .env file.")).toBeVisible();
   expect(ttsCalled).toBe(false);
-  await expect(page.getByRole("button", { name: "Push to talk as Aria" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Retry DM response" })).toBeVisible();
 });
 
 test("mute prevents narration audio from playing", async ({ page }) => {

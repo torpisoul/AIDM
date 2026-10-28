@@ -36,6 +36,13 @@ type VoiceProfile = {
   text: string;
 };
 
+type PlayerChoice =
+  | { kind: "action"; text: string }
+  | { kind: "pass" }
+  | { kind: "group" };
+type PlayerResponses = Record<string, PlayerChoice>;
+const GROUP_SPEAKER_ID = "party";
+
 const initialPlayers: Player[] = [
   { id: "aria", name: "Aria", character: "Liora · Elf Ranger", initials: "AR", color: "lilac", hp: 24, maxHp: 28 },
   { id: "bren", name: "Bren", character: "Thorne · Human Fighter", initials: "BR", color: "rust", hp: 31, maxHp: 36 },
@@ -93,6 +100,8 @@ function nowLabel() {
 
 function App() {
   const [players, setPlayers] = useState(initialPlayers);
+  const [playerResponses, setPlayerResponses] = useState<PlayerResponses>({});
+  const [groupAction, setGroupAction] = useState<string | null>(null);
   const [activePlayerId, setActivePlayerId] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [messages, setMessages] = useState(initialMessages);
@@ -112,6 +121,8 @@ function App() {
   const audioUrlRef = useRef<string | null>(null);
   const ttsRequestRef = useRef<AbortController | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
+  const playerResponsesRef = useRef<PlayerResponses>({});
+  const roundSubmittingRef = useRef(false);
   const streamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const captureId = useRef(0);
@@ -302,7 +313,11 @@ function App() {
       if (typeof result?.text !== "string" || !result.text.trim()) {
         throw new Error("No speech was recognized. Speak clearly and try again.");
       }
-      await submitPlayerAction(playerId, result.text);
+      if (playerId === GROUP_SPEAKER_ID) {
+        recordGroupAction(result.text);
+      } else {
+        recordPlayerResponse(playerId, result.text);
+      }
     } catch (error) {
       setActivePlayerId(null);
       setPhase("idle");
@@ -376,38 +391,18 @@ function App() {
     }
   };
 
-  const submitPlayerAction = async (playerId: string, action: string) => {
-    const player = players.find((candidate) => candidate.id === playerId);
-    if (!player) {
-      setActivePlayerId(null);
-      setPhase("idle");
-      setNotice("Select a player before sending an action.");
-      return;
-    }
-    const text = action.trim();
-    if (!text) {
-      setActivePlayerId(null);
-      setPhase("idle");
-      pressStartedAt.current = 0;
-      setNotice("No action was provided. Try again or use text input.");
-      return;
-    }
-    if (text.length > 500) {
-      setActivePlayerId(null);
-      setPhase("idle");
-      pressStartedAt.current = 0;
-      setNotice("Actions must be 500 characters or fewer.");
-      return;
-    }
-
+  const submitPartyResponses = async (responses: PlayerResponses, partyAction: string | null = null) => {
+    if (roundSubmittingRef.current) return;
+    roundSubmittingRef.current = true;
     if (!pressStartedAt.current) pressStartedAt.current = performance.now();
-    addMessage({
-      kind: "player",
-      speaker: `${player.name} · ${player.character.split(" · ")[0]}`,
-      text,
+    const completedResponses = players.map((player) => {
+      const response = responses[player.id];
+      return {
+        player: { name: player.name, character: player.character },
+        action: response?.kind === "action" ? response.text : null,
+        choice: response?.kind === "group" ? "group" : null,
+      };
     });
-    setActivePlayerId(null);
-    setTypedAction("");
     const history: StoryTurn[] = messages
       .filter((message) => message.kind === "player" || message.kind === "narration")
       .slice(-12)
@@ -418,14 +413,14 @@ function App() {
     while (history[0]?.role === "dm") history.shift();
 
     setPhase("thinking");
-    setNotice("The Dungeon Master is weaving the next moment…");
+    setNotice("The Dungeon Master is weaving the party’s choices together…");
     try {
       const response = await fetch(dmEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: text,
-          player: { name: player.name, character: player.character },
+          responses: completedResponses,
+          groupAction: partyAction,
           story: storySettings,
           history,
         }),
@@ -445,6 +440,10 @@ function App() {
         text: narration,
         voiceId: "dm-narrator",
       });
+      playerResponsesRef.current = {};
+      setPlayerResponses({});
+      setGroupAction(null);
+      setActivePlayerIdForText(players[0]?.id ?? null);
       await playNarration(narration);
     } catch (error) {
       setPhase("idle");
@@ -452,18 +451,112 @@ function App() {
       setNotice(error instanceof Error
         ? error.message
         : "The Dungeon Master could not respond. Check the AI service and try again.");
+    } finally {
+      roundSubmittingRef.current = false;
     }
+  };
+
+  const recordPlayerResponse = (
+    playerId: string,
+    action: string | null,
+    choiceKind: PlayerChoice["kind"] = action === null ? "pass" : "action",
+  ) => {
+    const player = players.find((candidate) => candidate.id === playerId);
+    if (!player) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      setNotice("Select a player before submitting a response.");
+      return;
+    }
+    const text = action?.trim() ?? null;
+    if (text !== null && !text) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice("No action was provided. Try again or use text input.");
+      return;
+    }
+    if (text !== null && text.length > 500) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice("Actions must be 500 characters or fewer.");
+      return;
+    }
+    if (Object.hasOwn(playerResponsesRef.current, playerId)) return;
+
+    if (!pressStartedAt.current) pressStartedAt.current = performance.now();
+    const response: PlayerChoice = choiceKind === "group"
+      ? { kind: "group" }
+      : choiceKind === "pass" || text === null
+        ? { kind: "pass" }
+        : { kind: "action", text };
+    addMessage({
+      kind: "player",
+      speaker: `${player.name} · ${player.character.split(" · ")[0]}`,
+      text: response.kind === "group"
+        ? "Chooses to go with the group."
+        : response.kind === "pass"
+          ? "Chooses to do nothing this turn."
+          : response.text,
+    });
+    setActivePlayerId(null);
+    setPhase("idle");
+    setTypedAction("");
+    const nextResponses = { ...playerResponsesRef.current, [playerId]: response };
+    playerResponsesRef.current = nextResponses;
+    setPlayerResponses(nextResponses);
+    const isUnanimousGroup = players.every((candidate) => nextResponses[candidate.id]?.kind === "group");
+    const nextPlayer = players.find((candidate) => !Object.hasOwn(nextResponses, candidate.id));
+    setActivePlayerIdForText(isUnanimousGroup ? GROUP_SPEAKER_ID : nextPlayer?.id ?? null);
+    setNotice("");
+
+    if (players.every((candidate) => Object.hasOwn(nextResponses, candidate.id)) && !isUnanimousGroup) {
+      void submitPartyResponses(nextResponses);
+    }
+  };
+
+  const recordGroupAction = (action: string) => {
+    const text = action.trim();
+    if (!text || text.length > 500) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice(text ? "Actions must be 500 characters or fewer." : "No group action was provided. Try again or use text input.");
+      return;
+    }
+    if (!players.every((player) => playerResponsesRef.current[player.id]?.kind === "group")) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      setNotice("Every player must choose “Go with the group” before submitting a group action.");
+      return;
+    }
+
+    if (!pressStartedAt.current) pressStartedAt.current = performance.now();
+    addMessage({ kind: "player", speaker: "THE PARTY", text });
+    setActivePlayerId(null);
+    setPhase("idle");
+    setTypedAction("");
+    setGroupAction(text);
+    setNotice("");
+    void submitPartyResponses(playerResponsesRef.current, text);
   };
 
   const submitTextAction = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!typedAction.trim() || activePlayerId || phase !== "idle") return;
     if (!activePlayerIdForText) {
-      setNotice("Select a player before sending an action.");
+      setNotice("All players have submitted their response.");
       return;
     }
-    void submitPlayerAction(activePlayerIdForText, typedAction);
+    if (activePlayerIdForText === GROUP_SPEAKER_ID) {
+      recordGroupAction(typedAction);
+    } else {
+      recordPlayerResponse(activePlayerIdForText, typedAction);
+    }
   };
+
+  const submitNoAction = (playerId: string) => recordPlayerResponse(playerId, null);
 
   const updateHp = (playerId: string, delta: number) => {
     setPlayers((current) => current.map((player) => player.id === playerId
@@ -638,7 +731,8 @@ function App() {
           <div className="player-grid">
             {players.map((player) => {
               const isActive = activePlayerId === player.id;
-              const isLocked = Boolean(activePlayerId && !isActive) || phase !== "idle" && !isActive;
+              const hasResponded = Object.hasOwn(playerResponses, player.id);
+              const isLocked = Boolean(activePlayerId && !isActive) || phase !== "idle" || hasResponded;
               const hpPercent = (player.hp / player.maxHp) * 100;
               return (
                 <article className={`player-card ${isActive ? "player-active" : ""} ${isLocked ? "player-locked" : ""}`} key={player.id}>
@@ -654,47 +748,118 @@ function App() {
                     <span><span className="heart">♥</span> {player.hp}<span className="stat-muted">/{player.maxHp} HP</span></span>
                     <div className="hp-track"><span style={{ width: `${hpPercent}%` }} /></div>
                   </div>
-                  <button
-                    className={`talk-button ${isActive ? "talk-active" : ""}`}
-                    disabled={isLocked}
-                    onPointerDown={(event) => {
-                      event.preventDefault();
-                      event.currentTarget.setPointerCapture(event.pointerId);
-                      handleTalkPointerDown(player.id);
-                    }}
-                    onPointerUp={() => handleTalkPointerUp(player.id)}
-                    onPointerCancel={() => handleTalkPointerUp(player.id)}
-                    onKeyDown={(event) => {
-                      if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+                  <div className="player-turn-actions">
+                    <button
+                      className={`talk-button ${isActive ? "talk-active" : ""}`}
+                      disabled={isLocked}
+                      onPointerDown={(event) => {
                         event.preventDefault();
+                        event.currentTarget.setPointerCapture(event.pointerId);
                         handleTalkPointerDown(player.id);
-                      }
-                    }}
-                    onKeyUp={(event) => {
-                      if (event.key === " " || event.key === "Enter") {
-                        event.preventDefault();
-                        handleTalkPointerUp(player.id);
-                      }
-                    }}
-                    onContextMenu={(event) => event.preventDefault()}
-                    aria-label={`Push to talk as ${player.name}`}
-                  >
-                    <span className="mic-icon" aria-hidden="true">●</span>
-                    {isActive ? "RELEASE TO SEND" : "HOLD TO TALK"}
-                    {isActive && <span className="recording-dot" />}
-                  </button>
+                      }}
+                      onPointerUp={() => handleTalkPointerUp(player.id)}
+                      onPointerCancel={() => handleTalkPointerUp(player.id)}
+                      onKeyDown={(event) => {
+                        if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+                          event.preventDefault();
+                          handleTalkPointerDown(player.id);
+                        }
+                      }}
+                      onKeyUp={(event) => {
+                        if (event.key === " " || event.key === "Enter") {
+                          event.preventDefault();
+                          handleTalkPointerUp(player.id);
+                        }
+                      }}
+                      onContextMenu={(event) => event.preventDefault()}
+                      aria-label={`Push to talk as ${player.name}`}
+                    >
+                      <span className="mic-icon" aria-hidden="true">●</span>
+                      {isActive ? "RELEASE TO SEND" : hasResponded ? "RESPONSE RECEIVED" : "HOLD TO TALK"}
+                      {isActive && <span className="recording-dot" />}
+                    </button>
+                    <button
+                      type="button"
+                      className="pass-button"
+                      disabled={isLocked}
+                      onClick={() => submitNoAction(player.id)}
+                      aria-label={`Do nothing as ${player.name}`}
+                    >
+                      Do nothing
+                    </button>
+                    <button
+                      type="button"
+                      className="pass-button group-choice-button"
+                      disabled={isLocked}
+                      onClick={() => recordPlayerResponse(player.id, null, "group")}
+                      aria-label={`Go with the group as ${player.name}`}
+                    >
+                      Go with the group
+                    </button>
+                  </div>
                 </article>
               );
             })}
           </div>
+          <div className="round-progress" aria-live="polite">
+            <span>{Object.keys(playerResponses).length} of {players.length} responses received</span>
+            <span>Each player can speak, submit text, do nothing, or go with the group.</span>
+            {players.every((player) => Object.hasOwn(playerResponses, player.id))
+              && (!players.every((player) => playerResponses[player.id]?.kind === "group") || groupAction)
+              && phase === "idle" && (
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => void submitPartyResponses(playerResponses, groupAction)}
+              >
+                Retry DM response
+              </button>
+            )}
+          </div>
+          {players.every((player) => playerResponses[player.id]?.kind === "group") && (
+            <div className="group-response">
+              <span>{groupAction ? `Party intention: ${groupAction}` : "Everyone chose to go with the group. One player can speak for the party."}</span>
+              {!groupAction && (
+                <button
+                  className={`talk-button ${activePlayerId === GROUP_SPEAKER_ID ? "talk-active" : ""}`}
+                  disabled={phase !== "idle" || Boolean(activePlayerId)}
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    handleTalkPointerDown(GROUP_SPEAKER_ID);
+                  }}
+                  onPointerUp={() => handleTalkPointerUp(GROUP_SPEAKER_ID)}
+                  onPointerCancel={() => handleTalkPointerUp(GROUP_SPEAKER_ID)}
+                  onKeyDown={(event) => {
+                    if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+                      event.preventDefault();
+                      handleTalkPointerDown(GROUP_SPEAKER_ID);
+                    }
+                  }}
+                  onKeyUp={(event) => {
+                    if (event.key === " " || event.key === "Enter") {
+                      event.preventDefault();
+                      handleTalkPointerUp(GROUP_SPEAKER_ID);
+                    }
+                  }}
+                  onContextMenu={(event) => event.preventDefault()}
+                  aria-label="Push to talk for the party"
+                >
+                  <span className="mic-icon" aria-hidden="true">●</span>
+                  {activePlayerId === GROUP_SPEAKER_ID ? "RELEASE TO SEND PARTY ACTION" : "HOLD TO SPEAK FOR THE PARTY"}
+                  {activePlayerId === GROUP_SPEAKER_ID && <span className="recording-dot" />}
+                </button>
+              )}
+            </div>
+          )}
 
           <div className={`capture-status ${phase !== "idle" ? "capture-busy" : ""}`} aria-live="polite">
             <span className={`status-pulse ${phase}`} />
             <span className="capture-copy">{phase === "recording" ? "Listening to" : phaseLabels[phase]}</span>
-            {activePlayerId && <strong>{players.find((player) => player.id === activePlayerId)?.name}</strong>}
+            {activePlayerId && <strong>{activePlayerId === GROUP_SPEAKER_ID ? "The party" : players.find((player) => player.id === activePlayerId)?.name}</strong>}
             {phase === "recording" && <span className="recording-timer">{String(Math.floor(elapsed / 60)).padStart(2, "0")}:{String(elapsed % 60).padStart(2, "0")}</span>}
             {phase === "recording" && isMicReady && <span className="mic-ready"><i /> MIC ON</span>}
-            <span className="status-hint">{activePlayerId ? "Other players are locked until the turn is released." : isMuted ? "DM voice playback muted · microphone capture remains available" : "One speaker at a time · Hold a player button to speak"}</span>
+            <span className="status-hint">{activePlayerId ? "Other players are locked until the turn is released." : isMuted ? "DM voice playback muted · microphone capture remains available" : "Responses stay private from the DM until everyone has replied."}</span>
           </div>
 
           <form className="text-action" onSubmit={submitTextAction}>
@@ -708,16 +873,20 @@ function App() {
               onChange={(event) => setActivePlayerIdForText(event.target.value || null)}
             >
               <option value="">Player…</option>
-              {players.map((player) => <option value={player.id} key={player.id}>{player.name}</option>)}
+              {players.filter((player) => !Object.hasOwn(playerResponses, player.id)).map((player) => <option value={player.id} key={player.id}>{player.name}</option>)}
+              {players.length > 0 && players.every((player) => playerResponses[player.id]?.kind === "group")
+                && <option value={GROUP_SPEAKER_ID}>The party</option>}
             </select>
             <input
               value={typedAction}
               onChange={(event) => setTypedAction(event.target.value)}
               maxLength={500}
-              placeholder={inputMode === "text" ? "Type an action or ask the DM…" : "Text fallback for unsupported browsers…"}
+              placeholder={activePlayerIdForText === GROUP_SPEAKER_ID
+                ? "Type the party’s shared intention…"
+                : inputMode === "text" ? "Type an action or ask the DM…" : "Text fallback for unsupported browsers…"}
               aria-label="Action or question"
             />
-            <button type="submit" className="send-button" disabled={!typedAction.trim() || Boolean(activePlayerId) || phase !== "idle"} aria-label="Send action">↑</button>
+            <button type="submit" className="send-button" disabled={!typedAction.trim() || !activePlayerIdForText || Boolean(activePlayerId) || phase !== "idle"} aria-label="Send action">↑</button>
           </form>
 
           {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}

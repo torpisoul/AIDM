@@ -18,16 +18,64 @@ export function validateDMRequest(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return { error: "Request body must be a JSON object." };
   }
-  if (typeof payload.action !== "string" || !payload.action.trim()) {
-    return { error: "Action must be a non-empty string." };
-  }
-  if (payload.action.trim().length > MAX_ACTION_LENGTH) {
-    return { error: `Action must be ${MAX_ACTION_LENGTH} characters or fewer.` };
-  }
-  if (!payload.player || typeof payload.player !== "object"
-      || typeof payload.player.name !== "string" || !payload.player.name.trim()
-      || typeof payload.player.character !== "string") {
-    return { error: "Player name and character are required." };
+  const isPartyRound = Array.isArray(payload.responses);
+  let action = null;
+  let player = null;
+  let responses = null;
+  let groupAction = null;
+  if (isPartyRound) {
+    if (payload.responses.length !== 4) {
+      return { error: "A party round must contain exactly 4 responses." };
+    }
+    responses = [];
+    for (const response of payload.responses) {
+      if (!response || typeof response !== "object" || Array.isArray(response)
+          || !response.player || typeof response.player !== "object"
+          || typeof response.player.name !== "string" || !response.player.name.trim()
+          || typeof response.player.character !== "string"
+          || response.choice !== undefined && response.choice !== null && response.choice !== "group"
+          || response.choice === "group" && response.action !== null
+          || !(response.action === null
+            || typeof response.action === "string" && response.action.trim()
+              && response.action.trim().length <= MAX_ACTION_LENGTH)) {
+        return { error: "Each party response must include a player and an action of 500 characters or fewer, a null action to pass, or a group choice." };
+      }
+      responses.push({
+        player: {
+          name: response.player.name.trim().slice(0, 60),
+          character: response.player.character.trim().slice(0, 100),
+        },
+        action: response.action === null ? null : response.action.trim(),
+        choice: response.choice === "group" ? "group" : null,
+      });
+    }
+    const allChooseGroup = responses.every((response) => response.choice === "group");
+    if (payload.groupAction !== undefined && payload.groupAction !== null
+        && (typeof payload.groupAction !== "string" || !payload.groupAction.trim()
+          || payload.groupAction.trim().length > MAX_ACTION_LENGTH)) {
+      return { error: `Group action must be a non-empty string of ${MAX_ACTION_LENGTH} characters or fewer.` };
+    }
+    groupAction = payload.groupAction?.trim() || null;
+    if (allChooseGroup !== Boolean(groupAction)) {
+      return { error: "A group action is required only when all players choose to go with the group." };
+    }
+  } else {
+    if (typeof payload.action !== "string" || !payload.action.trim()) {
+      return { error: "Action must be a non-empty string." };
+    }
+    if (payload.action.trim().length > MAX_ACTION_LENGTH) {
+      return { error: `Action must be ${MAX_ACTION_LENGTH} characters or fewer.` };
+    }
+    if (!payload.player || typeof payload.player !== "object"
+        || typeof payload.player.name !== "string" || !payload.player.name.trim()
+        || typeof payload.player.character !== "string") {
+      return { error: "Player name and character are required." };
+    }
+    action = payload.action.trim();
+    player = {
+      name: payload.player.name.trim().slice(0, 60),
+      character: payload.player.character.trim().slice(0, 100),
+    };
   }
   if (!payload.story || typeof payload.story !== "object" || Array.isArray(payload.story)) {
     return { error: "Story settings are required." };
@@ -61,11 +109,10 @@ export function validateDMRequest(payload) {
 
   return {
     value: {
-      action: payload.action.trim(),
-      player: {
-        name: payload.player.name.trim().slice(0, 60),
-        character: payload.player.character.trim().slice(0, 100),
-      },
+      action,
+      player,
+      responses,
+      groupAction,
       story,
       history,
     },
@@ -112,11 +159,20 @@ export async function generateDMResponse({ payload, env = process.env, fetchImpl
     role: turn.role === "dm" ? "model" : "user",
     parts: [{ text: turn.text }],
   }));
+  const actionText = validated.value.responses
+    ? `The party takes these actions in this turn:\n${validated.value.responses.map(({ player, action, choice }) =>
+      `- ${player.name} (${player.character}): ${action
+        ?? (validated.value.groupAction && validated.value.responses.every((response) => response.choice === "group")
+          ? "joins the group's shared intention."
+          : choice === "group"
+            ? "goes with the group, without a separate action."
+            : "does nothing this turn.")}`).join("\n")}${
+      validated.value.groupAction ? `\n\nSpeaking for the party, one player says:\n${validated.value.groupAction}` : ""
+    }\n\nRespond to their combined choices and continue the adventure.`
+    : `${validated.value.player.name} (${validated.value.player.character}) takes this action:\n${validated.value.action}\n\nContinue the adventure in response.`;
   contents.push({
     role: "user",
-    parts: [{
-      text: `${validated.value.player.name} (${validated.value.player.character}) takes this action:\n${validated.value.action}\n\nContinue the adventure in response.`,
-    }],
+    parts: [{ text: actionText }],
   });
 
   try {
