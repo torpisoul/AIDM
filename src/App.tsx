@@ -1,4 +1,34 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { resolveAdventureAction } from "./adventure";
+
+type SpeechRecognitionAlternative = { transcript: string };
+type SpeechRecognitionResult = {
+  isFinal: boolean;
+  length: number;
+  [index: number]: SpeechRecognitionAlternative;
+};
+type SpeechRecognitionResultEvent = {
+  resultIndex: number;
+  results: ArrayLike<SpeechRecognitionResult>;
+};
+type SpeechRecognitionErrorEvent = { error: string };
+type SpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onresult: ((event: SpeechRecognitionResultEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+type SpeechRecognitionConstructor = new () => SpeechRecognition;
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: SpeechRecognitionConstructor;
+  webkitSpeechRecognition?: SpeechRecognitionConstructor;
+};
 
 type Player = {
   id: string;
@@ -99,13 +129,13 @@ function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioUrlRef = useRef<string | null>(null);
   const ttsRequestRef = useRef<AbortController | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const transcriptRef = useRef("");
+  const speechErrorRef = useRef("");
   const captureId = useRef(0);
   const pressStartedAt = useRef(0);
   const messageEndRef = useRef<HTMLDivElement>(null);
   const messageId = useRef(5);
-  const timers = useRef<number[]>([]);
 
   const addMessage = useCallback((message: Omit<Message, "id" | "time">) => {
     setMessages((current) => [...current, { ...message, id: messageId.current++, time: nowLabel() }]);
@@ -116,12 +146,13 @@ function App() {
   }, [messages]);
 
   useEffect(() => () => {
-    timers.current.forEach(window.clearTimeout);
     audioRef.current?.pause();
     ttsRequestRef.current?.abort();
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    recorderRef.current?.state !== "inactive" && recorderRef.current?.stop();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
+    captureId.current += 1;
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    recognition?.abort();
   }, []);
 
   useEffect(() => {
@@ -138,138 +169,109 @@ function App() {
 
   const startTalk = async (playerId: string) => {
     if (activePlayerId || phase !== "idle") return;
+    const speechWindow = window as SpeechRecognitionWindow;
+    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      setNotice("Voice transcription is not supported in this browser. Switch to text input or try a Chromium-based browser.");
+      return;
+    }
+
     const currentCaptureId = ++captureId.current;
     setActivePlayerId(playerId);
     setPhase("recording");
     setNotice("");
     pressStartedAt.current = performance.now();
+    transcriptRef.current = "";
+    speechErrorRef.current = "";
 
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        setIsMicReady(false);
-        setNotice("Microphone access is not available in this browser. You can still use text input.");
-        return;
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (captureId.current !== currentCaptureId) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-      streamRef.current = stream;
-      if (typeof MediaRecorder === "undefined") {
-        stream.getTracks().forEach((track) => track.stop());
-        streamRef.current = null;
-        throw new Error("MediaRecorder is not supported");
-      }
-      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
-        .find((candidate) => MediaRecorder.isTypeSupported(candidate));
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recorderRef.current = recorder;
-      recorder.ondataavailable = (event) => {
-        if (event.data.size) {
-          setNotice("Audio captured locally. Connect the audio relay to transcribe and respond.");
+      const recognition = new Recognition();
+      recognition.lang = navigator.language || "en-US";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.onstart = () => {
+        if (captureId.current === currentCaptureId) setIsMicReady(true);
+      };
+      recognition.onresult = (event) => {
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          if (result.isFinal) transcriptRef.current += `${result[0].transcript} `;
         }
       };
-      recorder.onerror = () => {
-        setNotice("The browser could not record audio. Check microphone permissions and try again.");
+      recognition.onerror = (event) => {
+        if (event.error === "aborted" || captureId.current !== currentCaptureId) return;
+        speechErrorRef.current = event.error === "not-allowed"
+          ? "Microphone permission was denied. Allow microphone access or switch to text input."
+          : `Speech recognition failed (${event.error}). Try again or use text input.`;
       };
-      recorder.start(100);
-      setIsMicReady(true);
+      recognition.onend = () => {
+        if (recognitionRef.current !== recognition || captureId.current !== currentCaptureId) return;
+        recognitionRef.current = null;
+        setIsMicReady(false);
+        const transcript = transcriptRef.current.trim();
+        transcriptRef.current = "";
+        if (speechErrorRef.current) {
+          setActivePlayerId(null);
+          setPhase("idle");
+          pressStartedAt.current = 0;
+          setNotice(speechErrorRef.current);
+          return;
+        }
+        if (!transcript) {
+          setActivePlayerId(null);
+          setPhase("idle");
+          pressStartedAt.current = 0;
+          setNotice("No speech was transcribed. Try again or use text input.");
+          return;
+        }
+        void submitPlayerAction(playerId, transcript);
+      };
+      recognitionRef.current = recognition;
+      recognition.start();
     } catch (error) {
       if (captureId.current !== currentCaptureId) return;
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+      recognitionRef.current = null;
       setIsMicReady(false);
-      setNotice(error instanceof DOMException && error.name === "NotAllowedError"
-        ? "Microphone permission was denied. Allow microphone access or switch to text input."
-        : "Could not start the microphone. Check that it is connected and try again.");
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice(error instanceof Error
+        ? `Could not start speech recognition: ${error.message}`
+        : "Could not start speech recognition. Check microphone permissions and try again.");
     }
-  };
-
-  const stopRecorder = () => {
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state !== "inactive") recorder.stop();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    recorderRef.current = null;
-    streamRef.current = null;
-    setIsMicReady(false);
   };
 
   const releaseTalk = (playerId: string) => {
     if (activePlayerId !== playerId) return;
-    captureId.current += 1;
-    stopRecorder();
-    const player = players.find((candidate) => candidate.id === playerId);
-    if (!player) return;
-
-    addMessage({
-      kind: "player",
-      speaker: `${player.name} · ${player.character.split(" · ")[0]}`,
-      text: "Audio captured — connect a speech-to-text provider to transcribe this turn.",
-    });
-    const elapsedMs = Math.round(performance.now() - pressStartedAt.current);
-    setLatency(elapsedMs);
-    setActivePlayerId(null);
-    setPhase("idle");
-    setNotice("Audio capture works in this browser. Transcription and the AI DM response need a configured backend.");
+    setPhase("transcribing");
+    setNotice("Transcribing your turn…");
+    recognitionRef.current?.stop();
   };
 
-  const submitTextAction = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const text = typedAction.trim();
-    if (!text || activePlayerId || phase !== "idle") return;
-    const player = players.find((candidate) => candidate.id === activePlayerIdForText);
-    if (!player) {
-      setNotice("Select a player before sending an action.");
-      return;
-    }
-    addMessage({
-      kind: "player",
-      speaker: `${player.name} · ${player.character.split(" · ")[0]}`,
-      text,
-    });
-    setTypedAction("");
-    setPhase("thinking");
-    setNotice("Text action captured. Connect a DM service to resolve the turn.");
-    const timer = window.setTimeout(() => setPhase("idle"), 1200);
-    timers.current.push(timer);
-  };
-
-  const updateHp = (playerId: string, delta: number) => {
-    setPlayers((current) => current.map((player) => player.id === playerId
-      ? { ...player, hp: Math.max(0, Math.min(player.maxHp, player.hp + delta)) }
-      : player));
-  };
-
-  const playVoiceDemo = async () => {
-    if (phase !== "idle" || activePlayerId) return;
-    setLatency(null);
-    const narration = "You find a set of small, hurried footprints in the mud. They leave the road and disappear into the bracken, heading north — toward a low hill crowned with old standing stones.";
-    addMessage({
-      kind: "narration",
-      speaker: "THE DUNGEON MASTER",
-      text: narration,
-      voiceId: "dm-narrator",
-    });
-
+  const playNarration = async (narration: string) => {
     if (isMuted) {
-      setNotice("Demo narration added to the feed. Unmute DM voice playback to hear it.");
+      if (pressStartedAt.current) {
+        setLatency(Math.round(performance.now() - pressStartedAt.current));
+        pressStartedAt.current = 0;
+      }
+      setPhase("idle");
+      setNotice("DM response added to the feed. Unmute DM voice playback to hear it.");
       return;
     }
 
     const audio = audioRef.current;
     if (!audio) {
-      setNotice("The demo audio player is unavailable. Reload the page and try again.");
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice("The DM audio player is unavailable. Reload the page and try again.");
       return;
     }
 
     const request = new AbortController();
     ttsRequestRef.current?.abort();
     ttsRequestRef.current = request;
-    pressStartedAt.current = performance.now();
     setPhase("thinking");
-    setNotice("Generating narration with ElevenLabs…");
+    setNotice("Generating the Dungeon Master’s response…");
 
     try {
       const response = await fetch(ttsEndpoint, {
@@ -300,12 +302,85 @@ function App() {
     } catch (error) {
       if (request.signal.aborted) return;
       setPhase("idle");
+      pressStartedAt.current = 0;
       setNotice(error instanceof Error
         ? error.message
         : "Speech generation failed. Check the TTS server and try again.");
     } finally {
       if (ttsRequestRef.current === request) ttsRequestRef.current = null;
     }
+  };
+
+  const submitPlayerAction = async (playerId: string, action: string) => {
+    const player = players.find((candidate) => candidate.id === playerId);
+    if (!player) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      setNotice("Select a player before sending an action.");
+      return;
+    }
+    const text = action.trim();
+    if (!text) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice("No action was provided. Try again or use text input.");
+      return;
+    }
+    if (text.length > 500) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice("Actions must be 500 characters or fewer.");
+      return;
+    }
+
+    if (!pressStartedAt.current) pressStartedAt.current = performance.now();
+    addMessage({
+      kind: "player",
+      speaker: `${player.name} · ${player.character.split(" · ")[0]}`,
+      text,
+    });
+    setActivePlayerId(null);
+    setTypedAction("");
+    const narration = resolveAdventureAction(text);
+    addMessage({
+      kind: "narration",
+      speaker: "THE DUNGEON MASTER",
+      text: narration,
+      voiceId: "dm-narrator",
+    });
+    await playNarration(narration);
+  };
+
+  const submitTextAction = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!typedAction.trim() || activePlayerId || phase !== "idle") return;
+    if (!activePlayerIdForText) {
+      setNotice("Select a player before sending an action.");
+      return;
+    }
+    void submitPlayerAction(activePlayerIdForText, typedAction);
+  };
+
+  const updateHp = (playerId: string, delta: number) => {
+    setPlayers((current) => current.map((player) => player.id === playerId
+      ? { ...player, hp: Math.max(0, Math.min(player.maxHp, player.hp + delta)) }
+      : player));
+  };
+
+  const playVoiceDemo = async () => {
+    if (phase !== "idle" || activePlayerId) return;
+    setLatency(null);
+    const narration = "You find a set of small, hurried footprints in the mud. They leave the road and disappear into the bracken, heading north — toward a low hill crowned with old standing stones.";
+    addMessage({
+      kind: "narration",
+      speaker: "THE DUNGEON MASTER",
+      text: narration,
+      voiceId: "dm-narrator",
+    });
+    pressStartedAt.current = performance.now();
+    await playNarration(narration);
   };
 
   const toggleMute = () => {
@@ -423,7 +498,6 @@ function App() {
                       handleTalkPointerDown(player.id);
                     }}
                     onPointerUp={() => handleTalkPointerUp(player.id)}
-                    onPointerLeave={() => handleTalkPointerUp(player.id)}
                     onPointerCancel={() => handleTalkPointerUp(player.id)}
                     onKeyDown={(event) => {
                       if ((event.key === " " || event.key === "Enter") && !event.repeat) {
@@ -474,7 +548,8 @@ function App() {
             <input
               value={typedAction}
               onChange={(event) => setTypedAction(event.target.value)}
-              placeholder={inputMode === "text" ? "Type an action or ask the DM…" : "Text fallback for unsupported microphones…"}
+              maxLength={500}
+              placeholder={inputMode === "text" ? "Type an action or ask the DM…" : "Text fallback for unsupported browsers…"}
               aria-label="Action or question"
             />
             <button type="submit" className="send-button" disabled={!typedAction.trim() || Boolean(activePlayerId) || phase !== "idle"} aria-label="Send action">↑</button>
@@ -492,7 +567,7 @@ function App() {
             <button className="icon-button log-menu" aria-label="Session log options">···</button>
           </div>
           <div className="session-metrics">
-            <div><span className="metric-label">VOICE RELAY</span><strong><i className="offline-dot" /> DEMO MODE</strong></div>
+            <div><span className="metric-label">VOICE INPUT</span><strong><i className="offline-dot" /> BROWSER STT</strong></div>
             <div><span className="metric-label">LAST TURN</span><strong>{latency !== null ? `${latency}ms` : "—"}</strong></div>
           </div>
           <div className="feed-list" aria-live="polite">
@@ -509,7 +584,7 @@ function App() {
             <div ref={messageEndRef} />
           </div>
           <div className="pipeline-panel">
-            <div className="pipeline-title"><span>DEMO AUDIO</span><span className="demo-badge">LOCAL CLIP</span></div>
+            <div className="pipeline-title"><span>DM VOICE LOOP</span><span className="demo-badge">BRANCHING DEMO</span></div>
             <audio
               ref={audioRef}
               className="demo-audio"
@@ -527,7 +602,7 @@ function App() {
                 setNotice("Could not load the sample narration. Refresh the page and try again.");
               }}
             />
-            <p>Sample narration plays locally. Player microphone audio is not transcribed or sent to a DM yet.</p>
+            <p>Browser speech recognition feeds an authored branching scene, then ElevenLabs voices the DM reply. Browser recognition may process audio through its speech service; this app does not upload recordings to its backend.</p>
           </div>
           <footer className="log-footer"><span>SESSION 01</span><span>Autosaved just now</span></footer>
         </aside>

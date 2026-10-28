@@ -27,35 +27,34 @@ test("plays real narration audio in the browser", async ({ page }) => {
   await expect(page.getByText("Ready when you are")).toBeVisible();
 });
 
-test("keeps the active speaker locked to a single player", async ({ page }) => {
+test("transcribes a player's voice, resolves their action, and voices the DM reply", async ({ page }) => {
+  let ttsRequestBody: { text: string } | undefined;
+  await page.route("**/api/tts", async (route) => {
+    ttsRequestBody = route.request().postDataJSON();
+    await route.fulfill({ status: 200, contentType: "audio/wav", body: narrationAudio });
+  });
   await page.addInitScript(() => {
-    class TestRecorder {
-      state = "inactive";
-      ondataavailable: ((event: { data: Blob }) => void) | null = null;
-      onerror: (() => void) | null = null;
-
-      static isTypeSupported() {
-        return false;
-      }
-
+    class TestRecognition {
+      onstart: (() => void) | null = null;
+      onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; length: number; 0: { transcript: string } }> }) => void) | null = null;
+      onerror: ((event: { error: string }) => void) | null = null;
+      onend: (() => void) | null = null;
       start() {
-        this.state = "recording";
+        this.onstart?.();
       }
-
       stop() {
-        this.state = "inactive";
-        this.ondataavailable?.({ data: new Blob(["audio"]) });
+        this.onresult?.({
+          resultIndex: 0,
+          results: [{ isFinal: true, length: 1, 0: { transcript: "I follow the footprints" } }],
+        });
+        this.onend?.();
       }
+      abort() {}
     }
 
-    const fakeTrack = { stop() {} };
-    Object.defineProperty(navigator, "mediaDevices", {
+    Object.defineProperty(window, "SpeechRecognition", {
       configurable: true,
-      value: { getUserMedia: async () => ({ getTracks: () => [fakeTrack] }) },
-    });
-    Object.defineProperty(window, "MediaRecorder", {
-      configurable: true,
-      value: TestRecorder,
+      value: TestRecognition,
     });
   });
 
@@ -66,18 +65,48 @@ test("keeps the active speaker locked to a single player", async ({ page }) => {
   await ariaButton.dispatchEvent("pointerdown", { pointerId: 1, pointerType: "mouse", button: 0 });
   await expect(page.getByText("Listening to")).toBeVisible();
   await expect(brenButton).toBeDisabled();
+  await ariaButton.dispatchEvent("pointerleave", { pointerId: 1, pointerType: "mouse" });
+  await expect(page.getByText("Listening to")).toBeVisible();
+  await expect(brenButton).toBeDisabled();
   await ariaButton.dispatchEvent("pointerup", { pointerId: 1, pointerType: "mouse", button: 0 });
+  await expect(page.getByText("I follow the footprints", { exact: false })).toBeVisible();
+  await expect(page.getByText("You follow the small footprints off the road", { exact: false })).toBeVisible();
+  await expect.poll(() => ttsRequestBody?.text).toContain("Which clue do you pursue?");
+  await expect(brenButton).toBeDisabled();
+  await page.getByLabel("Dungeon Master narration audio").evaluate((element) => {
+    (element as HTMLAudioElement).pause();
+  });
   await expect(brenButton).toBeEnabled();
-  await expect(page.getByText("Transcription and the AI DM response need a configured backend.", { exact: false })).toBeVisible();
+});
+
+test("reports unsupported speech recognition and preserves text input", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "SpeechRecognition", { configurable: true, value: undefined });
+    Object.defineProperty(window, "webkitSpeechRecognition", { configurable: true, value: undefined });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Push to talk as Aria" }).dispatchEvent("pointerdown", {
+    pointerId: 1,
+    pointerType: "mouse",
+    button: 0,
+  });
+  await expect(page.getByText(/Voice transcription is not supported in this browser/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Push to talk as Aria" })).toBeEnabled();
 });
 
 test("submits a text action to the session feed", async ({ page }) => {
+  let ttsRequestBody: { text: string } | undefined;
+  await page.route("**/api/tts", async (route) => {
+    ttsRequestBody = route.request().postDataJSON();
+    await route.fulfill({ status: 200, contentType: "audio/wav", body: narrationAudio });
+  });
   await page.goto("/");
   await page.getByRole("textbox", { name: "Action or question" }).fill("I inspect the standing stones.");
   await page.getByRole("button", { name: "Send action" }).click();
 
   await expect(page.getByText("I inspect the standing stones.")).toBeVisible();
-  await expect(page.getByText("Connect a DM service to resolve the turn.", { exact: false })).toBeVisible();
+  await expect(page.getByText("At the standing stones, you find a narrow seam", { exact: false })).toBeVisible();
+  await expect.poll(() => ttsRequestBody?.text).toContain("How do you investigate?");
 });
 
 test("mute prevents narration audio from playing", async ({ page }) => {

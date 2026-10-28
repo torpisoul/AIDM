@@ -1,9 +1,9 @@
 # Emberkeep Table Console
 
 A shared-tablet MVP for a voice-enabled tabletop RPG session. The console
-provides four player-specific push-to-talk controls, browser microphone capture,
-a single active-speaker lock, a session feed, party hit-point controls, and
-ElevenLabs narration playback through a local server endpoint.
+provides four player-specific push-to-talk controls, browser speech recognition,
+a single active-speaker lock, a branching Briar Glen scene, a session feed,
+party hit-point controls, and ElevenLabs narration through a server endpoint.
 
 ## Run locally
 
@@ -36,20 +36,28 @@ Start the app and TTS server together:
 npm run dev
 ```
 
-Open the Vite URL printed in the terminal and press **Play voice demo**. The app
-sends narration text to `POST /api/tts`; the local server calls ElevenLabs with
-the configured voice and returns the generated MP3 for playback. Restart the
-dev server after changing `.env`.
+Open the Vite URL printed in the terminal. Hold a player's **Hold to talk**
+button, speak, and release; or select a player, type an action, and send it.
+Browser speech recognition transcribes voice input. The scene uses simple
+authored branches to respond to player intent, then sends the DM's narration
+text to `POST /api/tts`; the local server calls ElevenLabs with the configured
+voice and returns the generated MP3 for playback. **Play voice demo** remains
+available for a standalone narration sample. Restart the dev server after
+changing `.env`.
 
-Microphone capture requires a secure browser context (localhost is supported)
-and user permission. Hold a player's **Hold to talk** button and release it to
-end capture. The captured audio stays in the browser; it is not uploaded or
-transcribed. Text actions can be submitted from the same tablet.
+Voice input requires a secure browser context (localhost is supported),
+microphone permission, and a browser with the Web Speech API; Chromium-based
+browsers are recommended. Speech recognition may process audio through the
+browser's speech service. This app does not upload recordings to its backend;
+the transcript is resolved in the browser and only the DM narration text is
+sent to ElevenLabs. Use text input if speech recognition is unavailable.
 
-The bundled sample audio is available in the player as a fallback. Live
-microphone transcription, AI DM responses, WebSocket transport, and synchronized
-multi-device playback remain future work. The TTS endpoint accepts up to 5,000
-characters per request and does not expose provider error details or credentials.
+This is a technical and player-agency prototype, not an AI DM: authored
+branching rules respond to a few action intents, with a generic response for
+other actions. A model-generated DM, persistent campaign state, WebSocket
+transport, and synchronized multi-device playback remain future work. The TTS
+endpoint accepts up to 5,000 characters per request and does not expose provider
+credentials.
 
 ## Checks
 
