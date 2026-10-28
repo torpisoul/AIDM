@@ -27,7 +27,7 @@ body {
     #111312;
 }
 
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible {
   outline: 2px solid var(--amber);
@@ -224,10 +224,43 @@ h1 {
   font-size: 20px;
   line-height: 1.4;
   text-shadow: 0 2px 8px #191a16;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
 }
 .scene-caption { position: absolute; bottom: 19px; left: 34px; z-index: 1; color: #c5b99f; font-size: 8px; }
 .caption-line { display: inline-block; width: 15px; height: 1px; margin: 0 8px 3px 0; background: var(--amber); }
 .scene-grain { position: absolute; inset: 0; opacity: .1; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.22'/%3E%3C/svg%3E"); pointer-events: none; }
+
+.story-editor {
+  margin-top: 13px;
+  padding: 14px;
+  border: 1px solid #2e312d;
+  border-radius: 5px;
+  background: #171918;
+}
+.story-editor-heading, .story-editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.story-editor-heading p { margin: 5px 0 0; color: #777c75; font-size: 9px; }
+.story-editor .outline-button { flex: 0 0 auto; padding: 8px 10px; font-size: 9px; }
+.story-editor-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.story-editor-fields label { display: flex; flex-direction: column; gap: 6px; color: #b7b7af; font-size: 9px; }
+.story-editor-fields textarea {
+  width: 100%;
+  min-height: 86px;
+  padding: 9px;
+  resize: vertical;
+  border: 1px solid #303431;
+  border-radius: 4px;
+  background: #111312;
+  color: #d3d1c7;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.story-editor-fields textarea:focus { border-color: #786143; }
+.story-editor-fields textarea:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.story-editor-footer { grid-column: 1 / -1; color: #737870; font-size: 8px; }
+.story-editor-footer .text-button { flex: 0 0 auto; }
 
 .party-header { margin: 29px 0 14px; }
 .party-count { color: #737770; font-size: 10px; }
@@ -405,6 +438,9 @@ h1 {
   .scene-content { top: 35px; left: 20px; }
   .scene-content p { font-size: 17px; }
   .scene-caption { left: 20px; bottom: 15px; }
+  .story-editor { padding: 11px; }
+  .story-editor-fields { grid-template-columns: 1fr; gap: 10px; }
+  .story-editor-footer { align-items: flex-start; }
   .player-grid { gap: 8px; }
   .player-card { padding: 11px 9px 9px; }
   .player-card-top { gap: 7px; }

@@ -1,34 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { resolveAdventureAction } from "./adventure";
-
-type SpeechRecognitionAlternative = { transcript: string };
-type SpeechRecognitionResult = {
-  isFinal: boolean;
-  length: number;
-  [index: number]: SpeechRecognitionAlternative;
-};
-type SpeechRecognitionResultEvent = {
-  resultIndex: number;
-  results: ArrayLike<SpeechRecognitionResult>;
-};
-type SpeechRecognitionErrorEvent = { error: string };
-type SpeechRecognition = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onstart: (() => void) | null;
-  onresult: ((event: SpeechRecognitionResultEvent) => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-};
-type SpeechRecognitionConstructor = new () => SpeechRecognition;
-type SpeechRecognitionWindow = Window & {
-  SpeechRecognition?: SpeechRecognitionConstructor;
-  webkitSpeechRecognition?: SpeechRecognitionConstructor;
-};
+import {
+  DEFAULT_STORY_SETTINGS,
+  isStorySettings,
+  STORY_SETTINGS_KEY,
+  type StorySettings,
+  type StoryTurn,
+} from "./story";
 
 type Player = {
   id: string;
@@ -107,6 +84,8 @@ const phaseLabels: Record<Phase, string> = {
 };
 
 const ttsEndpoint = import.meta.env.VITE_TTS_API_URL || "/api/tts";
+const sttEndpoint = import.meta.env.VITE_STT_API_URL || "/api/stt";
+const dmEndpoint = import.meta.env.VITE_DM_API_URL || "/api/dm";
 
 function nowLabel() {
   return new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date());
@@ -118,6 +97,9 @@ function App() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [messages, setMessages] = useState(initialMessages);
   const [notice, setNotice] = useState("");
+  const [storySettings, setStorySettings] = useState<StorySettings>(DEFAULT_STORY_SETTINGS);
+  const [storySettingsLoaded, setStorySettingsLoaded] = useState(false);
+  const [isStoryEditorOpen, setIsStoryEditorOpen] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [latency, setLatency] = useState<number | null>(null);
   const [voicePreview, setVoicePreview] = useState<VoiceProfile | null>(null);
@@ -129,10 +111,11 @@ function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioUrlRef = useRef<string | null>(null);
   const ttsRequestRef = useRef<AbortController | null>(null);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const transcriptRef = useRef("");
-  const speechErrorRef = useRef("");
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   const captureId = useRef(0);
+  const captureReleasedRef = useRef(false);
   const pressStartedAt = useRef(0);
   const messageEndRef = useRef<HTMLDivElement>(null);
   const messageId = useRef(5);
@@ -145,14 +128,46 @@ function App() {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(STORY_SETTINGS_KEY);
+      if (saved) {
+        const parsed: unknown = JSON.parse(saved);
+        if (!isStorySettings(parsed)) {
+          throw new Error("Saved adventure settings have an unexpected format.");
+        }
+        setStorySettings(parsed);
+      }
+    } catch (error) {
+      setNotice(error instanceof Error
+        ? `Could not load saved adventure settings: ${error.message}`
+        : "Could not load saved adventure settings.");
+    } finally {
+      setStorySettingsLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!storySettingsLoaded) return;
+    try {
+      window.localStorage.setItem(STORY_SETTINGS_KEY, JSON.stringify(storySettings));
+    } catch (error) {
+      setNotice(error instanceof Error
+        ? `Could not save adventure settings in this browser: ${error.message}`
+        : "Could not save adventure settings in this browser.");
+    }
+  }, [storySettings, storySettingsLoaded]);
+
   useEffect(() => () => {
     audioRef.current?.pause();
     ttsRequestRef.current?.abort();
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
     captureId.current += 1;
-    const recognition = recognitionRef.current;
-    recognitionRef.current = null;
-    recognition?.abort();
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -169,10 +184,8 @@ function App() {
 
   const startTalk = async (playerId: string) => {
     if (activePlayerId || phase !== "idle") return;
-    const speechWindow = window as SpeechRecognitionWindow;
-    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
-    if (!Recognition) {
-      setNotice("Voice transcription is not supported in this browser. Switch to text input or try a Chromium-based browser.");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setNotice("Microphone access is not available in this browser. Use text input or open the app in a secure context.");
       return;
     }
 
@@ -181,71 +194,123 @@ function App() {
     setPhase("recording");
     setNotice("");
     pressStartedAt.current = performance.now();
-    transcriptRef.current = "";
-    speechErrorRef.current = "";
+    captureReleasedRef.current = false;
+    audioChunksRef.current = [];
 
     try {
-      const recognition = new Recognition();
-      recognition.lang = navigator.language || "en-US";
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onstart = () => {
-        if (captureId.current === currentCaptureId) setIsMicReady(true);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (captureId.current !== currentCaptureId) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      streamRef.current = stream;
+      if (captureReleasedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        setActivePlayerId(null);
+        setPhase("idle");
+        setNotice("Microphone is ready. Press and hold the player button again to record your turn.");
+        return;
+      }
+      if (typeof MediaRecorder === "undefined") {
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        throw new Error("Audio recording is not supported in this browser. Use text input instead.");
+      }
+
+      const mimeType = typeof MediaRecorder.isTypeSupported === "function"
+        ? ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"]
+          .find((candidate) => MediaRecorder.isTypeSupported(candidate))
+        : undefined;
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) audioChunksRef.current.push(event.data);
       };
-      recognition.onresult = (event) => {
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          if (result.isFinal) transcriptRef.current += `${result[0].transcript} `;
-        }
-      };
-      recognition.onerror = (event) => {
-        if (event.error === "aborted" || captureId.current !== currentCaptureId) return;
-        speechErrorRef.current = event.error === "not-allowed"
-          ? "Microphone permission was denied. Allow microphone access or switch to text input."
-          : `Speech recognition failed (${event.error}). Try again or use text input.`;
-      };
-      recognition.onend = () => {
-        if (recognitionRef.current !== recognition || captureId.current !== currentCaptureId) return;
-        recognitionRef.current = null;
+      recorder.onerror = () => {
+        if (captureId.current !== currentCaptureId) return;
+        captureId.current += 1;
+        recorderRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
         setIsMicReady(false);
-        const transcript = transcriptRef.current.trim();
-        transcriptRef.current = "";
-        if (speechErrorRef.current) {
-          setActivePlayerId(null);
-          setPhase("idle");
-          pressStartedAt.current = 0;
-          setNotice(speechErrorRef.current);
-          return;
-        }
-        if (!transcript) {
-          setActivePlayerId(null);
-          setPhase("idle");
-          pressStartedAt.current = 0;
-          setNotice("No speech was transcribed. Try again or use text input.");
-          return;
-        }
-        void submitPlayerAction(playerId, transcript);
+        setActivePlayerId(null);
+        setPhase("idle");
+        pressStartedAt.current = 0;
+        setNotice("The browser could not record audio. Check microphone permissions and try again.");
       };
-      recognitionRef.current = recognition;
-      recognition.start();
+      recorder.onstop = () => {
+        if (captureId.current !== currentCaptureId) return;
+        recorderRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        setIsMicReady(false);
+        const audio = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        audioChunksRef.current = [];
+        if (!audio.size) {
+          setActivePlayerId(null);
+          setPhase("idle");
+          pressStartedAt.current = 0;
+          setNotice("No audio was recorded. Hold the button while speaking, then release to send.");
+          return;
+        }
+        void transcribePlayerAudio(playerId, audio);
+      };
+      recorder.start();
+      setIsMicReady(true);
     } catch (error) {
       if (captureId.current !== currentCaptureId) return;
-      recognitionRef.current = null;
       setIsMicReady(false);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      recorderRef.current = null;
       setActivePlayerId(null);
       setPhase("idle");
       pressStartedAt.current = 0;
-      setNotice(error instanceof Error
-        ? `Could not start speech recognition: ${error.message}`
-        : "Could not start speech recognition. Check microphone permissions and try again.");
+      setNotice(error instanceof DOMException && error.name === "NotAllowedError"
+        ? "Microphone permission was denied. Allow microphone access or switch to text input."
+        : error instanceof Error
+          ? error.message
+          : "Could not start the microphone. Check that it is connected and try again.");
     }
   };
 
   const releaseTalk = (playerId: string) => {
     if (activePlayerId !== playerId) return;
+    captureReleasedRef.current = true;
+    setPhase("transcribing");
+    setNotice("Uploading audio for transcription…");
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+  };
+
+  const transcribePlayerAudio = async (playerId: string, audio: Blob) => {
     setPhase("transcribing");
     setNotice("Transcribing your turn…");
-    recognitionRef.current?.stop();
+    try {
+      const response = await fetch(sttEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": audio.type || "audio/webm" },
+        body: audio,
+      });
+      const result = await response.json().catch(() => null) as { text?: string; error?: string } | null;
+      if (!response.ok) {
+        throw new Error(result?.error || `Transcription failed (${response.status}).`);
+      }
+      if (typeof result?.text !== "string" || !result.text.trim()) {
+        throw new Error("No speech was recognized. Speak clearly and try again.");
+      }
+      await submitPlayerAction(playerId, result.text);
+    } catch (error) {
+      setActivePlayerId(null);
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice(error instanceof Error
+        ? error.message
+        : "Transcription failed. Check the speech service connection and try again.");
+    }
   };
 
   const playNarration = async (narration: string) => {
@@ -343,14 +408,51 @@ function App() {
     });
     setActivePlayerId(null);
     setTypedAction("");
-    const narration = resolveAdventureAction(text);
-    addMessage({
-      kind: "narration",
-      speaker: "THE DUNGEON MASTER",
-      text: narration,
-      voiceId: "dm-narrator",
-    });
-    await playNarration(narration);
+    const history: StoryTurn[] = messages
+      .filter((message) => message.kind === "player" || message.kind === "narration")
+      .slice(-12)
+      .map((message) => ({
+        role: message.kind === "player" ? "player" : "dm",
+        text: (message.kind === "player" ? `${message.speaker}: ${message.text}` : message.text).slice(0, 500),
+      }));
+    while (history[0]?.role === "dm") history.shift();
+
+    setPhase("thinking");
+    setNotice("The Dungeon Master is weaving the next moment…");
+    try {
+      const response = await fetch(dmEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: text,
+          player: { name: player.name, character: player.character },
+          story: storySettings,
+          history,
+        }),
+      });
+      const result = await response.json().catch(() => null) as { text?: string; error?: string } | null;
+      if (!response.ok) {
+        throw new Error(result?.error || `The Dungeon Master could not respond (${response.status}).`);
+      }
+      if (typeof result?.text !== "string" || !result.text.trim()) {
+        throw new Error("The Dungeon Master returned an empty response. Try again.");
+      }
+
+      const narration = result.text.trim();
+      addMessage({
+        kind: "narration",
+        speaker: "THE DUNGEON MASTER",
+        text: narration,
+        voiceId: "dm-narrator",
+      });
+      await playNarration(narration);
+    } catch (error) {
+      setPhase("idle");
+      pressStartedAt.current = 0;
+      setNotice(error instanceof Error
+        ? error.message
+        : "The Dungeon Master could not respond. Check the AI service and try again.");
+    }
   };
 
   const submitTextAction = (event: React.FormEvent<HTMLFormElement>) => {
@@ -455,12 +557,75 @@ function App() {
           <div className="scene-card">
             <div className="scene-sky" />
             <div className="scene-content">
-              <div className="scene-location"><span aria-hidden="true">⌖</span> THE OLD FOREST ROAD <span className="location-divider">·</span> DUSK</div>
-              <p>Beyond the pines, a village waits in<br className="desktop-break" /> a silence that feels almost deliberate.</p>
+              <div className="scene-location"><span aria-hidden="true">⌖</span> CURRENT SCENE <span className="location-divider">·</span> STORY SETUP</div>
+              <p>{storySettings.scene}</p>
             </div>
             <div className="scene-caption"><span className="caption-line" /> CURRENT SCENE</div>
             <div className="scene-grain" />
           </div>
+
+          <section className="story-editor" aria-label="DM story authoring">
+            <div className="story-editor-heading">
+              <div>
+                <span className="eyebrow">DM AUTHORING</span>
+                <p>Shape the story context used for the next response.</p>
+              </div>
+              <button
+                className="outline-button"
+                type="button"
+                aria-expanded={isStoryEditorOpen}
+                onClick={() => setIsStoryEditorOpen((open) => !open)}
+              >
+                {isStoryEditorOpen ? "Hide story settings" : "Edit story"}
+              </button>
+            </div>
+            {isStoryEditorOpen && (
+              <div className="story-editor-fields">
+                <label>
+                  Campaign premise
+                  <textarea
+                    value={storySettings.premise}
+                    maxLength={2_000}
+                    onChange={(event) => setStorySettings((current) => ({ ...current, premise: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  Current scene
+                  <textarea
+                    value={storySettings.scene}
+                    maxLength={1_000}
+                    onChange={(event) => setStorySettings((current) => ({ ...current, scene: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  DM style and tone
+                  <textarea
+                    value={storySettings.style}
+                    maxLength={1_000}
+                    onChange={(event) => setStorySettings((current) => ({ ...current, style: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  Story so far / author notes
+                  <textarea
+                    value={storySettings.notes}
+                    maxLength={2_000}
+                    onChange={(event) => setStorySettings((current) => ({ ...current, notes: event.target.value }))}
+                  />
+                </label>
+                <div className="story-editor-footer">
+                  <span>Saved in this browser · applied to the next DM turn</span>
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => setStorySettings(DEFAULT_STORY_SETTINGS)}
+                  >
+                    Restore defaults
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
 
           <div className="party-header">
             <div>
@@ -567,7 +732,7 @@ function App() {
             <button className="icon-button log-menu" aria-label="Session log options">···</button>
           </div>
           <div className="session-metrics">
-            <div><span className="metric-label">VOICE INPUT</span><strong><i className="offline-dot" /> BROWSER STT</strong></div>
+            <div><span className="metric-label">VOICE INPUT</span><strong><i className="offline-dot" /> ELEVEN STT</strong></div>
             <div><span className="metric-label">LAST TURN</span><strong>{latency !== null ? `${latency}ms` : "—"}</strong></div>
           </div>
           <div className="feed-list" aria-live="polite">
@@ -602,7 +767,7 @@ function App() {
                 setNotice("Could not load the sample narration. Refresh the page and try again.");
               }}
             />
-            <p>Browser speech recognition feeds an authored branching scene, then ElevenLabs voices the DM reply. Browser recognition may process audio through its speech service; this app does not upload recordings to its backend.</p>
+            <p>Player audio is transcribed by ElevenLabs, then an authored branching scene generates the DM reply.</p>
           </div>
           <footer className="log-footer"><span>SESSION 01</span><span>Autosaved just now</span></footer>
         </aside>

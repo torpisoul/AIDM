@@ -2,11 +2,14 @@ import "dotenv/config";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { generateDMResponse } from "./dm.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
-const MAX_BODY_BYTES = 16_384;
+const MAX_BODY_BYTES = 32_768;
+const MAX_AUDIO_BYTES = 4 * 1024 * 1024;
 const MAX_TEXT_LENGTH = 5_000;
 const MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_flash_v2_5";
+const DEFAULT_STT_MODEL_ID = "scribe_v1";
 const DEFAULT_ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"];
 const apiKey = process.env.ELEVENLABS_API_KEY?.trim();
 const voiceId = process.env.ELEVENLABS_VOICE_ID?.trim();
@@ -70,6 +73,26 @@ async function readJson(request) {
   }
 }
 
+async function readAudio(request) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_AUDIO_BYTES) {
+      const error = new Error("Audio must be 4 MB or smaller.");
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  if (!bytes) {
+    const error = new Error("Audio is empty. Hold the button while speaking, then release to send.");
+    error.status = 400;
+    throw error;
+  }
+  return Buffer.concat(chunks);
+}
+
 function isAllowedBrowserOrigin(request, env) {
   const origin = request.headers.origin;
   if (!origin) return true;
@@ -96,12 +119,125 @@ export function createApiServer({
     if (requestUrl.pathname === "/api/health" && request.method === "GET") {
       sendJson(response, 200, {
         ttsConfigured: Boolean(env.ELEVENLABS_API_KEY?.trim() && env.ELEVENLABS_VOICE_ID?.trim()),
+        sttConfigured: Boolean(env.ELEVENLABS_API_KEY?.trim()),
+        dmConfigured: Boolean(env.GEMINI_API_KEY?.trim()),
       });
       return;
     }
 
-    if (requestUrl.pathname !== "/api/tts") {
+    if (requestUrl.pathname !== "/api/tts" && requestUrl.pathname !== "/api/stt" && requestUrl.pathname !== "/api/dm") {
       sendJson(response, 404, { error: "Not found." });
+      return;
+    }
+
+    if (requestUrl.pathname === "/api/dm") {
+      if (request.method !== "POST") {
+        response.setHeader("Allow", "POST");
+        sendJson(response, 405, { error: "Method not allowed." });
+        return;
+      }
+
+      if (!isAllowedBrowserOrigin(request, env)) {
+        sendJson(response, 403, { error: "Requests from this origin are not allowed." });
+        return;
+      }
+
+      if (!request.headers["content-type"]?.toLowerCase().includes("application/json")) {
+        sendJson(response, 415, { error: "Content-Type must be application/json." });
+        return;
+      }
+
+      try {
+        const payload = await readJson(request);
+        const result = await generateDMResponse({ payload, env, fetchImpl });
+        sendJson(response, result.status, result.body);
+      } catch (error) {
+        sendJson(response, error.status ?? 500, {
+          error: error.status ? error.message : "Could not read the Dungeon Master request.",
+        });
+      }
+      return;
+    }
+
+    if (requestUrl.pathname === "/api/stt") {
+      if (request.method !== "POST") {
+        response.setHeader("Allow", "POST");
+        sendJson(response, 405, { error: "Method not allowed." });
+        return;
+      }
+
+      if (!isAllowedBrowserOrigin(request, env)) {
+        sendJson(response, 403, { error: "Requests from this origin are not allowed." });
+        return;
+      }
+
+      const contentType = request.headers["content-type"]?.split(";")[0].trim().toLowerCase() ?? "";
+      if (!contentType.startsWith("audio/")) {
+        sendJson(response, 415, { error: "Content-Type must be an audio format recorded by the browser." });
+        return;
+      }
+
+      const apiKey = env.ELEVENLABS_API_KEY?.trim();
+      if (!apiKey) {
+        sendJson(response, 503, {
+          error: "Speech transcription is not configured. Set ELEVENLABS_API_KEY in the server .env file, then restart the app.",
+        });
+        return;
+      }
+
+      try {
+        const audio = await readAudio(request);
+        const extension = contentType.includes("mp4") ? "mp4"
+          : contentType.includes("ogg") ? "ogg"
+            : contentType.includes("wav") ? "wav"
+              : contentType.includes("mpeg") || contentType.includes("mp3") ? "mp3"
+                : "webm";
+        const form = new FormData();
+        form.append("file", new Blob([audio], { type: contentType }), `player-turn.${extension}`);
+        form.append("model_id", env.ELEVENLABS_STT_MODEL_ID?.trim() || DEFAULT_STT_MODEL_ID);
+
+        const upstream = await fetchImpl("https://api.elevenlabs.io/v1/speech-to-text", {
+          method: "POST",
+          headers: { "xi-api-key": apiKey },
+          body: form,
+          signal: AbortSignal.timeout(60_000),
+        });
+
+        if (!upstream.ok) {
+          const providerError = getProviderError((await upstream.text()).slice(0, 4_096), apiKey);
+          const providerReason = `ElevenLabs transcription returned HTTP ${upstream.status}`
+            + (providerError.code ? ` (${providerError.code})` : "")
+            + (providerError.message ? `: ${providerError.message}` : "");
+          const status = upstream.status === 402 || upstream.status === 429 ? upstream.status : 502;
+          console.error(`ElevenLabs transcription returned HTTP ${upstream.status}${providerError.code ? ` (${providerError.code})` : ""}`);
+          sendJson(response, status, {
+            error: upstream.status === 402
+              ? `${providerReason}. Check your account's speech-to-text access and credits.`
+              : upstream.status === 429
+                ? `${providerReason}. Check the account's remaining credits or rate limit.`
+                : `${providerReason}. Check the API key and transcription model settings.`,
+          });
+          return;
+        }
+
+        const result = await upstream.json();
+        if (typeof result.text !== "string" || !result.text.trim()) {
+          sendJson(response, 422, { error: "No speech was recognized. Speak clearly and try again." });
+          return;
+        }
+        sendJson(response, 200, { text: result.text.trim() });
+      } catch (error) {
+        if (response.headersSent) {
+          response.destroy(error);
+        } else if (error.status) {
+          sendJson(response, error.status, { error: error.message });
+        } else if (error.name === "TimeoutError" || error.name === "AbortError") {
+          sendJson(response, 504, { error: "Speech transcription took too long. Please try again." });
+        } else {
+          console.error("ElevenLabs transcription request failed:", error.message);
+          sendJson(response, 502, { error: "Could not reach the speech transcription service. Check the server connection and try again." });
+        }
+      }
       return;
     }
 

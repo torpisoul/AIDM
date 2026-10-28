@@ -7,6 +7,8 @@ export async function handler() {
     },
     body: JSON.stringify({
       ttsConfigured: Boolean(process.env.ELEVENLABS_API_KEY?.trim() && process.env.ELEVENLABS_VOICE_ID?.trim()),
+      sttConfigured: Boolean(process.env.ELEVENLABS_API_KEY?.trim()),
+      dmConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
     }),
   };
 }
