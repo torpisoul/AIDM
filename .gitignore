@@ -8,3 +8,4 @@ playwright-report/
 .env
 .env.*
 !.env.example
+/docs/sources/gemini-ai-dungeon-master-tech-stack.md
